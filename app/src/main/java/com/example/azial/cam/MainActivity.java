@@ -123,7 +123,13 @@ public class MainActivity extends AppCompatActivity {
         //We will want to display the top 5 results
         String [] res = input.split(",");
 
-        return res[0]+"\n"+ res[1]+"\n" + res[2]+"\n" + res[3]+"\n" + res[4]+"\n";
+        String out = "";
+        for (int i= 0; i < res.length; i++) {
+            if(i == 5)
+                break;
+            out = out.concat(res[i]+"\n");
+        }
+        return out;
     }
 
     private void takePicture() {
