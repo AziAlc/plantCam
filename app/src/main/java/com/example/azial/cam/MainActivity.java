@@ -2,10 +2,17 @@
 package com.example.azial.cam;
 
 import android.Manifest;
+import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
+import android.content.res.AssetManager;
 import android.content.res.Resources;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -23,11 +30,13 @@ import android.os.CountDownTimer;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.support.annotation.NonNull;
 import android.support.annotation.RequiresApi;
 import android.support.v4.app.ActivityCompat;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
+import android.util.Log;
 import android.util.Size;
 import android.util.SparseIntArray;
 import android.view.Gravity;
@@ -35,20 +44,52 @@ import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.UUID;
+import org.tensorflow.lite.Interpreter;
+
 
 public class MainActivity extends AppCompatActivity {
+    private List<String> labelList;
+    protected Interpreter tflite;
+    private static final int DIM_BATCH_SIZE = 1;
+    private static final int DIM_PIXEL_SIZE = 3;
+    static final int DIM_IMG_SIZE_X = 224;
+    static final int DIM_IMG_SIZE_Y = 224;
+    private static final int IMAGE_MEAN = 128;
+    private static final float IMAGE_STD = 128.0f;
+    float[][] labelProbArray = null;
+    /* Preallocated buffers for storing image data in. */
+    private int[] intValues = new int[DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y];
+    /** A ByteBuffer to hold image data, to be feed into Tensorflow Lite as inputs. */
+    private ByteBuffer imgData = null;
+
+
+
+
 
     private Button btnCapture;
     private TextureView textureView;
@@ -75,6 +116,16 @@ public class MainActivity extends AppCompatActivity {
     private boolean mFlashSupported;
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
+
+    private PriorityQueue<Map.Entry<String, Float>> sortedLabels =
+            new PriorityQueue<>(
+                    3,
+                    new Comparator<Map.Entry<String, Float>>() {
+                        @Override
+                        public int compare(Map.Entry<String, Float> o1, Map.Entry<String, Float> o2) {
+                            return (o1.getValue()).compareTo(o2.getValue());
+                        }
+                    });
 
     CameraDevice.StateCallback stateCallback = new CameraDevice.StateCallback() {
         @Override
@@ -114,149 +165,143 @@ public class MainActivity extends AppCompatActivity {
                 takePicture();
             }
         });
+
+
+
+
+        try {
+            labelList = loadLabelList();
+            System.out.println(labelList);
+        } catch (IOException e) {
+            System.out.println("***********failed to load labela**************");
+        }
+
+        try {
+            tflite = new Interpreter(loadModelFile());
+        } catch (IOException e) {
+            System.out.println("***********failed to load model**************");
+        }
+        imgData = ByteBuffer.allocateDirect(4 * DIM_BATCH_SIZE * DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y * DIM_PIXEL_SIZE);
+        imgData.order(ByteOrder.nativeOrder());
     }
 
 
 
-    //Assuming we have a csv output from tenserFlow
-    public String  inputCSVParser(String input) {
-        //We will want to display the top 5 results
-        String [] res = input.split(",");
 
-        String out = "";
-        for (int i= 0; i < res.length; i++) {
-            if(i == 5)
-                break;
-            out = out.concat(res[i]+"\n");
+
+
+    /** Reads label list from Assets. */
+    private List<String> loadLabelList() throws IOException {
+        List<String> labelList = new ArrayList<String>();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(getApplicationContext().getAssets().open("labels.txt")));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            labelList.add(line);
         }
-        return out;
+        reader.close();
+        return labelList;
+    }
+    /** Memory-map the model file in Assets. */
+    private MappedByteBuffer loadModelFile() throws IOException {
+        AssetFileDescriptor fileDescriptor = getApplicationContext().getAssets().openFd("graph.lite");
+        FileInputStream inputStream = new FileInputStream(fileDescriptor.getFileDescriptor());
+        FileChannel fileChannel = inputStream.getChannel();
+        long startOffset = fileDescriptor.getStartOffset();
+        long declaredLength = fileDescriptor.getDeclaredLength();
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
+    }
+    /** Writes Image data into a {@code ByteBuffer}. */
+    private void convertBitmapToByteBuffer(Bitmap bitmap) {
+        if (imgData == null) {
+            return;
+        }
+        imgData.rewind();
+        bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+        int pixel = 0;
+        for (int i = 0; i < DIM_IMG_SIZE_X; ++i) {
+            for (int j = 0; j < DIM_IMG_SIZE_Y; ++j) {
+                final int val = intValues[pixel++];
+                imgData.putFloat((((val >> 16) & 0xFF)-IMAGE_MEAN)/IMAGE_STD);
+                imgData.putFloat((((val >> 8) & 0xFF)-IMAGE_MEAN)/IMAGE_STD);
+                imgData.putFloat((((val) & 0xFF)-IMAGE_MEAN)/IMAGE_STD);
+            }
+        }
+    }
+    /** Prints top-K labels, to be shown in UI as the results. */
+    private String printTopKLabels() {
+        for (int i = 0; i < labelList.size(); ++i) {
+            sortedLabels.add(new AbstractMap.SimpleEntry<>(labelList.get(i), labelProbArray[0][i]));
+            if (sortedLabels.size() > 3) {
+                sortedLabels.poll();
+            }
+        }
+        String textToShow = "";
+        final int size = sortedLabels.size();
+        for (int i = 0; i < size; ++i) {
+            Map.Entry<String, Float> label = sortedLabels.poll();
+            textToShow = String.format("\n%s: %4.2f",label.getKey(),label.getValue()) + textToShow;
+        }
+        return textToShow;
+    }
+    public Bitmap getResizedBitmap(Bitmap bm, int newWidth, int newHeight) {
+        int width = bm.getWidth();
+        int height = bm.getHeight();
+        float scaleWidth = ((float) newWidth) / width;
+        float scaleHeight = ((float) newHeight) / height;
+        // CREATE A MATRIX FOR THE MANIPULATION
+        Matrix matrix = new Matrix();
+        // RESIZE THE BIT MAP
+        matrix.postScale(scaleWidth, scaleHeight);
+
+        // "RECREATE" THE NEW BITMAP
+        Bitmap resizedBitmap = Bitmap.createBitmap(bm, 0, 0, width, height, matrix, false);
+        bm.recycle();
+        return resizedBitmap;
     }
 
     private void takePicture() {
         if(cameraDevice == null)
             return;
-        CameraManager manager = (CameraManager)getSystemService(Context.CAMERA_SERVICE);
-        try{
-            CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraDevice.getId());
-            Size[] jpegSizes = null;
-            if(characteristics != null)
-                jpegSizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                        .getOutputSizes(ImageFormat.JPEG);
 
-            //Capture image with custom size
-            int width = 640;
-            int height = 480;
-            if(jpegSizes != null && jpegSizes.length > 0)
-            {
-                width = jpegSizes[0].getWidth();
-                height = jpegSizes[0].getHeight();
-            }
-            final ImageReader reader = ImageReader.newInstance(width,height,ImageFormat.JPEG,1);
-            List<Surface> outputSurface = new ArrayList<>(2);
-            outputSurface.add(reader.getSurface());
-            outputSurface.add(new Surface(textureView.getSurfaceTexture()));
+        //reset label array for new output
+        labelProbArray = new float[1][labelList.size()];
 
-            final CaptureRequest.Builder captureBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            captureBuilder.addTarget(reader.getSurface());
-            captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+        //capture image
+        Bitmap bitmap = textureView.getBitmap(DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y);
+        convertBitmapToByteBuffer(bitmap);
 
-            //Check orientation base on device
-            int rotation = getWindowManager().getDefaultDisplay().getRotation();
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION,ORIENTATIONS.get(rotation));
+        // classify image
+        tflite.run(imgData, labelProbArray);
+        String output = printTopKLabels();
+
+        /*
+        // output label as toast
+        float yOffset = (float) (.114 *(Resources.getSystem().getDisplayMetrics().heightPixels));
+        final Toast t = Toast.makeText(getApplicationContext(), output, Toast.LENGTH_SHORT);
+        t.setGravity(Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, (int)yOffset  );
+        t.show();
+        */
 
 
-            //TENSERFLOW CODE HERE!
+        ImageView image = new ImageView(this);
+        image.setImageBitmap(getResizedBitmap(bitmap, 500, 500));
 
-            Context context = getApplicationContext();
-
-            //This is just a test string.
-            String output = "TV 90%\nCarpet 5%\nChess Board 85%";
-
-            //You can call this method to parse a csv and it will output the first 5 csvalues.
-            //inputCSVParser(some thing);
-
-            float yOffset = (float) (.114 *(Resources.getSystem().getDisplayMetrics().heightPixels));
-            final Toast t = Toast.makeText(context, output, Toast.LENGTH_SHORT);
-            t.setGravity(Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, (int)yOffset  );
-            t.show();
-
-
-
-            /*
-            file = new File(Environment.getExternalStorageDirectory()+"/"+UUID.randomUUID().toString()+".jpg");
-            ImageReader.OnImageAvailableListener readerListener = new ImageReader.OnImageAvailableListener() {
-                @Override
-                public void onImageAvailable(ImageReader imageReader) {
-                    Image image = null;
-                    try{
-                        image = reader.acquireLatestImage();
-                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                        byte[] bytes = new byte[buffer.capacity()];
-                        buffer.get(bytes);
-                        save(bytes);
-
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setMessage(output);
+        builder.setView(image);
+        builder.setPositiveButton("OK", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        dialog.dismiss();
                     }
-                    catch (FileNotFoundException e)
-                    {
-                        e.printStackTrace();
-                    }
-                    catch (IOException e)
-                    {
-                        e.printStackTrace();
-                    }
-                    finally {
-                        {
-                            if(image != null)
-                                image.close();
-                        }
-                    }
-                }
-                private void save(byte[] bytes) throws IOException {
-                    OutputStream outputStream = null;
-                    try{
-                        outputStream = new FileOutputStream(file);
-                        outputStream.write(bytes);
-                    }finally {
-                        if(outputStream != null)
-                            outputStream.close();
-                    }
-                }
-            };
-
-
-
-            reader.setOnImageAvailableListener(readerListener,mBackgroundHandler);
-            final CameraCaptureSession.CaptureCallback captureListener = new CameraCaptureSession.CaptureCallback() {
-                @Override
-                public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
-                    super.onCaptureCompleted(session, request, result);
-                    Toast.makeText(MainActivity.this, "Saved "+file, Toast.LENGTH_SHORT).show();
-                    createCameraPreview();
-                }
-            };
-
-            cameraDevice.createCaptureSession(outputSurface, new CameraCaptureSession.StateCallback() {
-                @Override
-                public void onConfigured(@NonNull CameraCaptureSession cameraCaptureSession) {
-                    try{
-                        cameraCaptureSession.capture(captureBuilder.build(),captureListener,mBackgroundHandler);
-                    } catch (CameraAccessException e) {
-                        e.printStackTrace();
-                    }
-                }
-
-                @Override
-                public void onConfigureFailed(@NonNull CameraCaptureSession cameraCaptureSession) {
-
-                }
-            },mBackgroundHandler);
-
-            */
-
-        } catch (CameraAccessException e) {
-            e.printStackTrace();
-        }
+                });
+        builder.create().show();
     }
+
+
+
+
+
 
     private void createCameraPreview() {
         try{
