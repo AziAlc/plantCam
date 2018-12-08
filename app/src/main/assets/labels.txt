@@ -1,5 +1,7 @@
 daisy
-dandelion
-roses
-sunflowers
-tulips
+marigold
+orchid
+poppy
+rose
+sunflower
+tulip

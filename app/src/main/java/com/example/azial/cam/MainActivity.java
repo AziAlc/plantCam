@@ -61,13 +61,22 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Calendar;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.Random;
 import java.util.UUID;
 import org.tensorflow.lite.Interpreter;
 
@@ -84,8 +93,9 @@ public class MainActivity extends AppCompatActivity {
     float[][] labelProbArray = null;
     /* Preallocated buffers for storing image data in. */
     private int[] intValues = new int[DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y];
-    /** A ByteBuffer to hold image data, to be feed into Tensorflow Lite as inputs. */
     private ByteBuffer imgData = null;
+    private Bitmap bitmap = null;
+    private String output = "";
 
 
 
@@ -168,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
 
 
 
-
+        //tflite stuff below
         try {
             labelList = loadLabelList();
             System.out.println(labelList);
@@ -184,10 +194,6 @@ public class MainActivity extends AppCompatActivity {
         imgData = ByteBuffer.allocateDirect(4 * DIM_BATCH_SIZE * DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y * DIM_PIXEL_SIZE);
         imgData.order(ByteOrder.nativeOrder());
     }
-
-
-
-
 
 
     /** Reads label list from Assets. */
@@ -239,7 +245,7 @@ public class MainActivity extends AppCompatActivity {
         final int size = sortedLabels.size();
         for (int i = 0; i < size; ++i) {
             Map.Entry<String, Float> label = sortedLabels.poll();
-            textToShow = String.format("\n%s: %4.2f",label.getKey(),label.getValue()) + textToShow;
+            textToShow = String.format("%s: %4.2f\n",label.getKey(),label.getValue()) + textToShow;
         }
         return textToShow;
     }
@@ -255,7 +261,6 @@ public class MainActivity extends AppCompatActivity {
 
         // "RECREATE" THE NEW BITMAP
         Bitmap resizedBitmap = Bitmap.createBitmap(bm, 0, 0, width, height, matrix, false);
-        bm.recycle();
         return resizedBitmap;
     }
 
@@ -267,12 +272,13 @@ public class MainActivity extends AppCompatActivity {
         labelProbArray = new float[1][labelList.size()];
 
         //capture image
-        Bitmap bitmap = textureView.getBitmap(DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y);
-        convertBitmapToByteBuffer(bitmap);
+        bitmap = textureView.getBitmap();
+        Bitmap bitmap_resized = getResizedBitmap(bitmap, DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y);
+        convertBitmapToByteBuffer(bitmap_resized);
 
         // classify image
         tflite.run(imgData, labelProbArray);
-        String output = printTopKLabels();
+        output = printTopKLabels();
 
         /*
         // output label as toast
@@ -283,18 +289,47 @@ public class MainActivity extends AppCompatActivity {
         */
 
 
-        ImageView image = new ImageView(this);
-        image.setImageBitmap(getResizedBitmap(bitmap, 500, 500));
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setMessage(output);
-        builder.setView(image);
-        builder.setPositiveButton("OK", new DialogInterface.OnClickListener() {
+        DialogInterface.OnClickListener actionListener = new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
-                        dialog.dismiss();
+                        if(which == -1){
+                            String root = Environment.getExternalStorageDirectory().toString();
+                            File myDir = new File(root + "/plantCam");
+                            myDir.mkdirs();
+
+                            SimpleDateFormat df = new SimpleDateFormat("yyyyMMdd'T'HHmmss");
+                            String currentDateTimeString = df.format(Calendar.getInstance().getTime());
+                            String cat = output.replace("\n", "")
+                                    .replace(": ", "")
+                                    .replace("0.", "");
+
+                            String fname = currentDateTimeString + "_" + cat + ".jpg";
+                            File file = new File(myDir, fname);
+                            if (file.exists())
+                                file.delete();
+                            try {
+                                FileOutputStream out = new FileOutputStream(file);
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out);
+                                out.flush();
+                                out.close();
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+                            Toast.makeText(getApplicationContext(), "Saved as fname", Toast.LENGTH_SHORT).show();
+                        }else {
+                            dialog.dismiss();
+                        }
                     }
-                });
+                };
+        ImageView image = new ImageView(this);
+        image.setImageBitmap(getResizedBitmap(bitmap, (int)(bitmap.getWidth()*0.75), (int)(bitmap.getHeight()*0.75)));
+        builder.setView(image);
+        builder.setTitle("Image Classification");
+        builder.setMessage(output);
+        builder.setPositiveButton("Save", actionListener);
+        builder.setNegativeButton("Cancel", actionListener);
         builder.create().show();
     }
 
